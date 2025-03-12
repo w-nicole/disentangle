@@ -2,27 +2,30 @@ import argparse
 import os
 import re
 import itertools as it
-
+import wandb
+import glob
+import uuid
 import numpy as np
 import torch
 import torch.optim as optim
 from scipy.io.wavfile import read
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+#from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from infowavegan import WaveGANGenerator, WaveGANDiscriminator, WaveGANQNetwork
 from utils import get_continuation_fname
-
+from scipy.io.wavfile import read, write
+import copy
 
 class AudioDataSet:
     def __init__(self, datadir, slice_len):
         print("Loading data")
-        dir = os.listdir(datadir)
-        x = np.zeros((len(dir), 1, slice_len))
+        wav_paths = glob.glob(os.path.join(datadir,"*_padded.wav"))
+        x = np.zeros((len(wav_paths), 1, slice_len))
         i = 0
-        for file in tqdm(dir):
-            audio = read(os.path.join(datadir, file))[1]
+        for file in tqdm(wav_paths):
+            audio = read(file)[1]
             if audio.shape[0] < slice_len:
                 audio = np.pad(audio, (0, slice_len - audio.shape[0]))
             audio = audio[:slice_len]
@@ -60,6 +63,29 @@ def gradient_penalty(G, D, real, fake, epsilon):
     grad_norm = grad.view(grad.shape[0], -1).norm(p=2, dim=1)  # norm along each batch
     penalty = ((grad_norm - 1) ** 2).unsqueeze(1)
     return penalty
+
+
+def write_out_wavs(G_z_2d, labels, logdir, epoch, partition, subfolder=None):
+    if subfolder is None:
+        epoch_path = os.path.join(logdir,'audio_files',str(epoch), partition)
+    else:
+        epoch_path = os.path.join(logdir,subfolder,str(epoch), partition)
+
+    if not os.path.exists(epoch_path):
+        os.makedirs(epoch_path)    
+
+    labels_local = labels.cpu().detach().numpy()
+    files_for_asr = []
+    # for each file in the batch, write out a wavfile
+    for j in range(G_z_2d.shape[0]):
+        audio_buffer = G_z_2d[j,:].detach().cpu().numpy()
+        
+        latent_code = ''.join([str(int(x))  for x in c[j,:].detach().to('cpu').numpy()])
+        
+        tf = os.path.join(epoch_path,latent_code + '_' + str(uuid.uuid4())+".wav")
+        write(tf, 16000, audio_buffer[0])
+        files_for_asr.append(copy.copy(tf))
+    return(files_for_asr)
 
 
 if __name__ == "__main__":
@@ -129,13 +155,67 @@ if __name__ == "__main__":
         action='store_true',
         help='Trains a fiwgan'
     )
+
+    parser.add_argument(
+        '--wandb_project',
+        type=str,
+        help='Name of the project for tracking in Weights and Biases',        
+    )
+
+    parser.add_argument(
+        '--wandb_group',
+        type=str,
+        help='Name of the group / experiment to which this version (id) belongs',        
+    )
+
+    parser.add_argument(
+        '--wandb_name',
+        type=str,
+        help='Name of this specific run',        
+    )
+
+    parser.add_argument(
+        '--no_wandb',
+        action='store_true',
+        help='Disables wandb logging'
+    )
+
     args = parser.parse_args()
+
+
+    if args.no_wandb: 
+        print('Disabling tracking with wandb')
+        wandb.init(mode="disabled")
+    else:
+
+        gpu_properties = torch.cuda.get_device_properties('cuda')
+        kwargs = {
+           'project' :  args.wandb_project,        
+           'config' : args.__dict__,
+           'group' : args.wandb_group,
+           'name' : args.wandb_name,
+           'save_code': True,
+           'config': {
+                'slurm_job_id' : os.getenv('SLURM_JOB_ID'),
+                'gpu_name' : gpu_properties.name,
+                'gpu_memory' : gpu_properties.total_memory,            
+                'script_name': os.path.basename(__file__)
+            }
+        }
+        wandb.init(**kwargs)
+
+    if not args.no_wandb: 
+        logdir = os.path.join(args.logdir, args.wandb_group, args.wandb_name, wandb.run.id)
+    else:
+        logdir = os.path.join(args.logdir, 'no_wandb_group', str(uuid.uuid4()), str(uuid.uuid4()))
+    if not os.path.exists(logdir):
+        os.makedirs(logdir)
+
     train_Q = args.ciw or args.fiw
 
     # Parameters
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     datadir = args.datadir
-    logdir = args.logdir
     SLICE_LEN = args.slice_len
     NUM_CATEG = args.num_categ
     NUM_EPOCHS = args.num_epochs
@@ -215,8 +295,6 @@ if __name__ == "__main__":
     else:
         print("Starting a new training")
 
-    # Set Up Writer
-    writer = SummaryWriter(logdir)
     step = start_step
 
     for epoch in range(start_epoch + 1, NUM_EPOCHS):
@@ -247,7 +325,7 @@ if __name__ == "__main__":
             penalty = gradient_penalty(G, D, real, fake, epsilon)
 
             D_loss = torch.mean(D(fake) - D(real) + LAMBDA * penalty)
-            writer.add_scalar('Loss/Discriminator', D_loss.detach().item(), step)
+            wandb.log({'Loss/Discriminator': D_loss.detach().item()}, step)
             D_loss.backward()
             optimizer_D.step()
 
@@ -272,16 +350,20 @@ if __name__ == "__main__":
 
                 G_z = G(z)
 
+                
+                if i > (pbar.total - 20):
+                    write_out_wavs(G_z, c, logdir, epoch, 'train')
+
                 # G Loss
                 G_loss = torch.mean(-D(G_z))
                 G_loss.backward(retain_graph=True)
-                writer.add_scalar('Loss/Generator', G_loss.detach().item(), step)
+                wandb.log({'Loss/Generator': G_loss.detach().item()}, step)
 
                 # Q Loss
                 if train_Q:
                     Q_loss = criterion_Q(Q(G_z), c)
                     Q_loss.backward()
-                    writer.add_scalar('Loss/Q_Network', Q_loss.detach().item(), step)
+                    wandb.log({'Loss/Q_Network': Q_loss.detach().item()}, step)                    
                     optimizer_Q.step()
 
                 # Update
